@@ -160,11 +160,11 @@ pub fn build(chapters: &[Chapter], span: Span, rate: i64, scale: i64, opts: &Opt
     let form = opts.form();
     let template = opts.template();
     let mut index = 0;
+    let mut empty = Vec::new();
     for c in list {
         let title = c.title.trim();
-        let place = describe(c);
         if title.is_empty() {
-            out.warnings.push(format!("{place}: タイトルが空なので出していません"));
+            empty.push(describe(c));
             continue;
         }
         index += 1;
@@ -182,6 +182,8 @@ pub fn build(chapters: &[Chapter], span: Span, rate: i64, scale: i64, opts: &Opt
         });
     }
 
+    summarize(&mut out.warnings, &empty, "タイトルが空なので出していません");
+
     // 同じ時刻（秒）が続くもの
     for i in 1..out.lines.len() {
         if out.lines[i].secs == out.lines[i - 1].secs {
@@ -194,6 +196,20 @@ pub fn build(chapters: &[Chapter], span: Span, rate: i64, scale: i64, opts: &Opt
         check_youtube(&mut out, span, rate, scale);
     }
     out
+}
+
+/// 同じ理由の警告を 1 行にまとめる（マークを拍ごとに打つ使い方では数百件になり、一覧を押し出す）。
+/// 3 件までは場所ごとに、それより多ければ件数と先頭の 3 件だけを出す
+pub fn summarize(warnings: &mut Vec<String>, places: &[String], reason: &str) {
+    const SHOWN: usize = 3;
+    if places.len() <= SHOWN {
+        for p in places {
+            warnings.push(format!("{p}: {reason}"));
+        }
+        return;
+    }
+    let head = places[..SHOWN].join("、");
+    warnings.push(format!("{} 件: {reason}（{head} ほか）", places.len()));
 }
 
 fn describe(c: &Chapter) -> String {
@@ -317,6 +333,16 @@ mod tests {
         let o = build(&c, Span { start: 300, end: 2100 }, 30, 1, &yt());
         assert_eq!(o.text(), "0:00 a\n0:20 b\n0:40 c");
         assert!(o.warnings.iter().any(|w| w.contains("範囲の外の 2 件")));
+    }
+
+    #[test]
+    fn many_empty_titles_are_one_warning() {
+        let mut v: Vec<Chapter> = (0..300).map(|i| ch(i * 30, "")).collect();
+        v.push(ch(0, "本編"));
+        let o = build(&v, Span { start: 0, end: 9000 }, 30, 1, &Options { style: Style::Niconico, template: String::new(), form: TimeForm::MSS });
+        assert_eq!(o.warnings.len(), 1, "{:?}", o.warnings);
+        assert!(o.warnings[0].starts_with("300 件: タイトルが空"), "{}", o.warnings[0]);
+        assert!(o.warnings[0].contains("0 フレーム目のマーク"));
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub struct Snapshot {
     pub named_layers: Vec<(usize, String)>,
     /// 読んだレイヤー（0 始まり）
     pub layer: Option<usize>,
+    /// 読んだシーンの名前（別のシーンを開いたままコピーしないよう、上に出す）
+    pub scene_name: String,
 }
 
 /// 読む。登録が終わる前なら None
@@ -51,7 +53,8 @@ pub fn read(settings: &Settings) -> Option<Result<Snapshot, String>> {
         let mut chapters = Vec::new();
         let mut warnings = Vec::new();
         let mut named = Vec::new();
-        for l in 0..=layer_max {
+        let scene_name = s.get_scene_name().unwrap_or_default();
+        for l in (0..=layer_max).filter(|_| settings.source == Source::Layer) {
             if let Ok(Some(name)) = s.get_layer_name(l) {
                 if !name.is_empty() {
                     named.push((l, name));
@@ -85,10 +88,11 @@ pub fn read(settings: &Settings) -> Option<Result<Snapshot, String>> {
                 }
             }
         }
-        (chapters, warnings, named, layer)
+        (chapters, warnings, named, layer, scene_name)
     });
     Some(match res {
-        Ok((chapters, warnings, named, layer)) => {
+        Ok((chapters, warnings, named, layer, scene_name)) => {
+            snap.scene_name = scene_name;
             snap.chapters = chapters;
             snap.warnings = warnings;
             snap.named_layers = named;
@@ -120,19 +124,15 @@ fn read_marks(s: &ReadSection, chapters: &mut Vec<Chapter>, warnings: &mut Vec<S
 
 fn read_layer(s: &ReadSection, layer: usize, chapters: &mut Vec<Chapter>, warnings: &mut Vec<String>) {
     let mut n = 0;
+    let mut unnamed = Vec::new();
     for (lf, h) in s.objects_in_layer(layer) {
         n += 1;
-        let title = title_of(s, h);
-        if title.is_none() {
-            warnings.push(format!(
-                "レイヤー {} の {} フレーム目: オブジェクト名が無いので出していません（テキストなら本文の 1 行目を使います）",
-                layer + 1,
-                lf.start
-            ));
-            continue;
+        match title_of(s, h) {
+            Some(title) => chapters.push(Chapter { frame: lf.start, title, layer: Some(layer) }),
+            None => unnamed.push(format!("レイヤー {} の {} フレーム目", layer + 1, lf.start)),
         }
-        chapters.push(Chapter { frame: lf.start, title: title.unwrap_or_default(), layer: Some(layer) });
     }
+    crate::format::summarize(warnings, &unnamed, "オブジェクト名が無いので出していません（テキストなら本文の 1 行目を使います）");
     if n == 0 {
         warnings.push(format!("レイヤー {} にオブジェクトがありません", layer + 1));
     }

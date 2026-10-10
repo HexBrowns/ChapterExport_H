@@ -1,13 +1,16 @@
 //! チャプター書き出しのウィンドウ（egui）
 //!
-//! 見えている間は、本体のイベント（オブジェクトの更新・シーンの変更）と 1 秒ごとに読み直す。
+//! 見えている間は、本体のイベント（オブジェクトの更新・シーンの変更）で読み直す。続けて来ても 0.4 秒に 1 回まで。
+//! マークが元のときだけ、1 秒ごとにも読み直す（マークの変更は本体のイベントで来ないことがあるため）。
+//! 再生中・ファイル出力中は間隔では読まない（出力中は本体が読み取りを断る）。
 //! 読むのは `call_read_section` だけ。書き込みは行の「移動」ボタン（今のフレームを動かす）だけで、
-//! そのときだけ `call_edit_section` を呼ぶ（ルール au2-rs-plugin「EditHandle」）。
+//! そのときだけ `call_edit_section` を呼ぶ（ルール au2-rs-plugin「EditHandle」「ウィンドウの重さ」）。
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use aviutl2::generic::EditState;
 use aviutl2_eframe::{eframe, egui, AviUtl2EframeHandle};
 
 use crate::format::{self, Options, Output, Span, Style, TimeForm};
@@ -18,10 +21,16 @@ use crate::{EDIT_HANDLE, OBJECT_DIRTY, PROJECT, SETTINGS, SETTINGS_GEN};
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(235, 200, 90);
 const RED: egui::Color32 = egui::Color32::from_rgb(235, 110, 110);
 
-/// 見えている間の読み直しの間隔（マークの変更は本体のイベントで来ないことがあるため）
+/// マークが元のときの読み直しの間隔（マークの変更は本体のイベントで来ないことがあるため）
 const POLL: Duration = Duration::from_secs(1);
+/// 本体のイベントが続けて来ても、読むのはこの間隔に 1 回まで（ドラッグ中はイベントが来続ける）
+const MIN_READ_GAP: Duration = Duration::from_millis(400);
+/// 1 回の読み取りがこれより長ければ、1 回だけログに出す
+const SLOW_READ: Duration = Duration::from_millis(50);
 /// 見えていない間に、見えたかどうかを調べる間隔
 const HIDDEN_CHECK: Duration = Duration::from_millis(500);
+/// 下に出す全体の警告の欄の高さの上限（超えたらその中でスクロールする）
+const WARNINGS_MAX_HEIGHT: f32 = 72.0;
 
 pub struct ChapterApp {
     _handle: AviUtl2EframeHandle,
@@ -29,7 +38,11 @@ pub struct ChapterApp {
     settings_gen: u64,
     snap: Option<Snapshot>,
     out: Output,
+    /// 読めなかった理由。前に読めた結果があれば、それを出したまま添える
     read_error: Option<String>,
+    /// 最後にログへ出した読めなかった理由（同じ理由を繰り返し出さない）
+    logged_error: Option<String>,
+    slow_read_logged: bool,
     last_read: Option<Instant>,
     status: String,
     status_is_error: bool,
@@ -49,6 +62,8 @@ impl ChapterApp {
             snap: None,
             out: Output::default(),
             read_error: None,
+            logged_error: None,
+            slow_read_logged: false,
             last_read: None,
             status: String::new(),
             status_is_error: false,
@@ -66,17 +81,28 @@ impl ChapterApp {
     }
 
     fn reload(&mut self) {
+        let started = Instant::now();
         match read::read(&self.settings) {
             None => return,
             Some(Ok(snap)) => {
                 self.read_error = None;
+                self.logged_error = None;
                 self.snap = Some(snap);
             }
             Some(Err(e)) => {
-                tracing::warn!("[ChapterExport_H] {e}");
+                // 出力中などで読めないときは、前に読めた結果を出したままにする（コピーできるように）。ログは理由ごとに 1 回
+                if self.logged_error.as_deref() != Some(e.as_str()) {
+                    tracing::warn!("[ChapterExport_H] {e}");
+                    self.logged_error = Some(e.clone());
+                }
                 self.read_error = Some(e);
-                self.snap = None;
             }
+        }
+        let took = started.elapsed();
+        if took > SLOW_READ && !self.slow_read_logged {
+            self.slow_read_logged = true;
+            let n = self.snap.as_ref().map(|s| s.chapters.len()).unwrap_or(0);
+            tracing::info!("[ChapterExport_H] 本体からの読み取りに {} ms（チャプター候補 {n} 件）", took.as_millis());
         }
         self.last_read = Some(Instant::now());
         self.rebuild();
@@ -87,6 +113,7 @@ impl ChapterApp {
             self.out = Output::default();
             return;
         };
+        let before = std::mem::take(&mut self.out);
         let span = match (self.settings.use_range, snap.range) {
             (true, Some((a, b))) => Span { start: a, end: b },
             _ => Span { start: 0, end: snap.frame_max },
@@ -95,6 +122,10 @@ impl ChapterApp {
         let mut w = snap.warnings.clone();
         w.append(&mut out.warnings);
         out.warnings = w;
+        // 一覧が変わったら「N 件をコピーしました」などの古い知らせを消す（失敗の知らせは残す）
+        if out != before && !self.status_is_error {
+            self.status.clear();
+        }
         self.out = out;
     }
 
@@ -111,11 +142,29 @@ impl ChapterApp {
             self.settings_gen = gen;
             OBJECT_DIRTY.store(true, Ordering::Release);
         }
-        let due = self.last_read.is_none_or(|t| t.elapsed() >= POLL);
+        let since = self.last_read.map(|t| t.elapsed());
+        // 前の読み取りから 0.4 秒経つまでは、印を残したまま待つ
+        if let Some(since) = since.filter(|s| *s < MIN_READ_GAP) {
+            if OBJECT_DIRTY.load(Ordering::Acquire) {
+                ctx.request_repaint_after(MIN_READ_GAP - since);
+                return;
+            }
+        }
+        // 間隔で読むのはマークが元で、編集中のときだけ（再生中・出力中は本体を待たせない）
+        let editing = matches!(EDIT_HANDLE.get_edit_state(), Ok(EditState::Edit));
+        let periodic = self.settings.source == Source::Mark && editing;
+        // 出力中に読めなかったときは、編集に戻ってから読み直す
+        let retry = self.read_error.is_some() && editing;
+        let due = since.is_none() || ((periodic || retry) && since.is_some_and(|s| s >= POLL));
         if OBJECT_DIRTY.swap(false, Ordering::AcqRel) || due {
             self.reload();
         }
-        ctx.request_repaint_after(POLL);
+        if periodic || retry {
+            ctx.request_repaint_after(POLL);
+        } else if !editing {
+            // 再生・出力が終わったら間隔の読み取りに戻るため、ときどき起きる
+            ctx.request_repaint_after(POLL);
+        }
     }
 
     fn render_top(&mut self, ui: &mut egui::Ui) {
@@ -128,6 +177,9 @@ impl ChapterApp {
                 .on_hover_text("指定したレイヤーに置いたオブジェクト。オブジェクト名（無ければテキストの本文の 1 行目）をタイトルにする");
             if ui.button("読み直す").clicked() {
                 OBJECT_DIRTY.store(true, Ordering::Release);
+            }
+            if let Some(s) = &self.snap {
+                ui.label(format!("シーン: {}", s.scene_name)).on_hover_text("いま開いているシーンから読みます");
             }
         });
         if self.settings.source == Source::Layer {
@@ -200,7 +252,10 @@ impl ChapterApp {
     fn render_rows(&mut self, ui: &mut egui::Ui) {
         if let Some(e) = &self.read_error {
             ui.colored_label(RED, e);
-            return;
+            if self.snap.is_none() {
+                return;
+            }
+            ui.label("前に読めた結果を出しています（ファイル出力の最中は本体から読めません）");
         }
         if self.out.lines.is_empty() {
             ui.label("チャプターがありません");
@@ -208,19 +263,22 @@ impl ChapterApp {
         }
         let cursor_layer = self.snap.as_ref().map(|s| s.cursor_layer).unwrap_or(0);
         let mut jump = None;
-        egui::Grid::new("rows").striped(true).num_columns(3).show(ui, |ui| {
-            for line in &self.out.lines {
-                if ui.small_button("移動").on_hover_text(format!("{} フレーム目へ", line.frame)).clicked() {
-                    jump = Some((line.layer.unwrap_or(cursor_layer), line.frame));
-                }
-                ui.monospace(&line.time);
+        // 行の高さはそろっているので、見えている行だけを組み立てる（チャプターが数百でもマウスを動かすたびに全行を作らない）
+        let row_height = ui.spacing().interact_size.y;
+        let lines = &self.out.lines;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_height, lines.len(), |ui, range| {
+            for line in &lines[range] {
                 ui.horizontal(|ui| {
-                    ui.label(&line.title);
-                    for w in &line.warnings {
-                        ui.colored_label(YELLOW, format!("⚠ {w}"));
+                    if ui.small_button("移動").on_hover_text(format!("{} フレーム目へ", line.frame)).clicked() {
+                        jump = Some((line.layer.unwrap_or(cursor_layer), line.frame));
                     }
+                    ui.monospace(&line.time);
+                    // 警告はタイトルより前に出す（長いタイトルで右へ押し出されて見えなくならないように）
+                    for w in &line.warnings {
+                        ui.colored_label(YELLOW, format!("※ {w}"));
+                    }
+                    ui.add(egui::Label::new(&line.title).truncate());
                 });
-                ui.end_row();
             }
         });
         if let Some((layer, frame)) = jump {
@@ -228,21 +286,43 @@ impl ChapterApp {
         }
     }
 
-    /// 今のフレームを動かす（ボタンを押したときだけ。本体の編集セクションが要る）
+    /// 今のフレームを動かす（ボタンを押したときだけ。本体の編集セクションが要る）。
+    /// タイムラインに見えていないフレームなら、表示もそこへ送る
     fn jump(&mut self, layer: usize, frame: usize) {
         if !EDIT_HANDLE.is_ready() {
             return;
         }
-        match EDIT_HANDLE.call_edit_section(move |e| e.set_cursor_layer_frame(layer, frame)) {
-            Ok(Ok(())) => {}
+        let info = EDIT_HANDLE.get_edit_info();
+        let shown = info.display_frame.contains(&frame);
+        let width = info.display_frame.len();
+        let display_layer = info.display_layer.start;
+        let res = EDIT_HANDLE.call_edit_section(move |e| {
+            e.set_cursor_layer_frame(layer, frame)?;
+            if !shown {
+                // 移った先が左から 1/4 の位置に来るように
+                e.set_display_layer_frame(display_layer, frame.saturating_sub(width / 4))?;
+            }
+            Ok::<(), aviutl2::generic::EditSectionError>(())
+        });
+        match res {
+            Ok(Ok(())) => {
+                if self.status_is_error {
+                    self.set_status(String::new());
+                }
+            }
             Ok(Err(e)) => self.set_error(format!("移動できませんでした: {e}")),
             Err(e) => self.set_error(format!("移動できませんでした: {e}")),
         }
     }
 
     fn render_bottom(&mut self, ui: &mut egui::Ui) {
-        for w in &self.out.warnings {
-            ui.colored_label(YELLOW, format!("⚠ {w}"));
+        // 警告が多くても一覧とボタンを押し出さないよう、決まった高さの中でスクロールする
+        if !self.out.warnings.is_empty() {
+            egui::ScrollArea::vertical().id_salt("warnings").max_height(WARNINGS_MAX_HEIGHT).auto_shrink([false, true]).show(ui, |ui| {
+                for w in &self.out.warnings {
+                    ui.colored_label(YELLOW, format!("※ {w}"));
+                }
+            });
         }
         ui.horizontal(|ui| {
             let has = !self.out.lines.is_empty();
@@ -362,9 +442,7 @@ impl eframe::App for ChapterApp {
         egui::Panel::top("top").show(ui, |ui| self.render_top(ui));
         egui::Panel::bottom("bottom").show(ui, |ui| self.render_bottom(ui));
         // 中央パネルは最後に追加する（ルール au2-rs-plugin「egui レイアウト」）
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.render_rows(ui));
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.render_rows(ui));
     }
 }
 

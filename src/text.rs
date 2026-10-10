@@ -1,6 +1,7 @@
 //! テキストオブジェクトの本文からタイトルを作る（本体と関係なく、cargo test で確かめる）。
 //!
 //! `unescape` と `segments` は TextReplace_H の `src/text.rs` を写したもの（直すときは両方を直す）。
+//! ただし `segments` には、閉じない `<` が多い長文で末尾まで探し直さない変更を足してある（v0.3.0。TextReplace_H は未反映）。
 //! 本体は改行を `\n` の 2 文字、`\` を `\\` で返す（実機で確認。`AI/docs/20261008_パラメータ編集_SDK実機確認.md`）。
 
 use std::ops::Range;
@@ -35,15 +36,23 @@ pub fn segments(text: &str) -> Vec<(Range<usize>, bool)> {
     let mut out = Vec::new();
     let mut plain_start = 0;
     let mut i = 0;
+    // 一度見つからなかった終わりの印は、それより後ろにも無い。探し直すと閉じない `<` の数 × 字数になる
+    let (mut no_comment_end, mut no_script_end, mut no_gt) = (false, false, false);
     while i < text.len() {
         if text[i..].starts_with('<') {
             let rest = &text[i..];
             let close = if rest.starts_with("<//") {
-                rest[3..].find("//>").map(|p| 3 + p + 3)
+                let c = if no_comment_end { None } else { rest[3..].find("//>").map(|p| 3 + p + 3) };
+                no_comment_end |= c.is_none();
+                c
             } else if rest.starts_with("<?") {
-                rest[2..].find("?>").map(|p| 2 + p + 2)
+                let c = if no_script_end { None } else { rest[2..].find("?>").map(|p| 2 + p + 2) };
+                no_script_end |= c.is_none();
+                c
             } else {
-                rest.find('>').map(|p| p + 1)
+                let c = if no_gt { None } else { rest.find('>').map(|p| p + 1) };
+                no_gt |= c.is_none();
+                c
             };
             if let Some(len) = close {
                 if plain_start < i {
