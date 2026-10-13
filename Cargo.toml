@@ -1,6 +1,6 @@
 [package]
 name = "chapter-export-h"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
 authors = ["HexBrowns"]
@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 # メニューから、隠れているウィンドウを前に出す・見えているかを調べる（MidpointTable_H と同じ）
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_DirectWrite", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = true

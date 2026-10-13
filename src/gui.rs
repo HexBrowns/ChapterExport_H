@@ -34,6 +34,8 @@ const WARNINGS_MAX_HEIGHT: f32 = 72.0;
 
 pub struct ChapterApp {
     _handle: AviUtl2EframeHandle,
+    /// 本体のフォント（窓が見えてから読む。`host_fonts`）
+    host_fonts: crate::host_fonts::LazyFonts,
     settings: Settings,
     settings_gen: u64,
     snap: Option<Snapshot>,
@@ -53,10 +55,12 @@ impl ChapterApp {
         cc.egui_ctx.all_styles_mut(|style| {
             style.visuals = aviutl2_eframe::aviutl2_visuals();
         });
-        cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
+        // 本体のフォントは窓が見えてから ui で読む（ここで読むと、本体の起動がこの窓の初期化を待つ間ずっと止まる。`host_fonts`）
+        let host_fonts = crate::host_fonts::LazyFonts::new(&handle).log_time("ChapterExport_H");
         let _ = crate::EGUI_CTX.set(cc.egui_ctx.clone());
         ChapterApp {
             _handle: handle,
+            host_fonts,
             settings: SETTINGS.lock().clone(),
             settings_gen: SETTINGS_GEN.load(Ordering::Acquire),
             snap: None,
@@ -433,6 +437,10 @@ fn finish_line_edit(ctx: &egui::Context, key: egui::Id, focused: bool, buf: Stri
 
 impl eframe::App for ChapterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 本体のフォントは窓が見えてから読む。読んだフレームは描かない（新しいフォントは次のフレームから効く。次のフレームは頼んである）
+        if self.host_fonts.load_if_visible(ui.ctx()) {
+            return;
+        }
         // 本体のパネルに出ていない間は読まない（イベントの印は残り、出たときに読む）
         if !crate::window_visible() {
             ui.ctx().request_repaint_after(HIDDEN_CHECK);
